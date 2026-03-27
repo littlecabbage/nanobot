@@ -157,10 +157,9 @@ class SelfTool(Tool):
             return f"_unregistered_tools: {list(self._loop._unregistered_tools.keys())}"
         if key in self.BLOCKED or key.startswith("__") or key in self._DENIED_ATTRS:
             return f"Error: '{key}' is not accessible"
-        val = getattr(self._loop, key, None)
-        if val is None:
-            return "'{key}' not found on agent".format(key=key)
-        return f"{key}: {val!r}"
+        if not hasattr(self._loop, key):
+            return f"'{key}' not found on agent"
+        return f"{key}: {getattr(self._loop, key)!r}"
 
     def _inspect_all(self) -> str:
         loop = self._loop
@@ -200,9 +199,6 @@ class SelfTool(Tool):
         if err := self._validate_key(key):
             return err
         if key in self.BLOCKED or key.startswith("__"):
-            self._audit("modify", f"BLOCKED {key}")
-            return f"Error: '{key}' is protected and cannot be modified"
-        if key in self.BLOCKED:
             self._audit("modify", f"BLOCKED {key}")
             return f"Error: '{key}' is protected and cannot be modified"
         if key in self.READONLY:
@@ -248,6 +244,10 @@ class SelfTool(Tool):
         if err:
             self._audit("modify", f"REJECTED {key}: {err}")
             return f"Error: {err}"
+        # Limit total keys to prevent unbounded memory growth
+        if key not in self._loop._runtime_vars and len(self._loop._runtime_vars) >= 64:
+            self._audit("modify", f"REJECTED {key}: max keys (64) reached")
+            return "Error: _runtime_vars is full (max 64 keys). Reset unused keys first."
         old = self._loop._runtime_vars.get(key)
         self._loop._runtime_vars[key] = value
         self._audit("modify", f"_runtime_vars.{key}: {old!r} -> {value!r}")

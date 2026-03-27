@@ -8,6 +8,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from nanobot.agent.loop import AgentLoop
 from nanobot.agent.tools.self import SelfTool
 
 
@@ -46,6 +47,9 @@ def _make_mock_loop(**overrides):
     loop.tools.tool_names = ["read_file", "write_file", "exec", "web_search", "self"]
     loop.tools.has.side_effect = lambda n: n in loop.tools.tool_names
     loop.tools.get.return_value = None
+
+    # Attach the real _watchdog_check method to the mock so tests exercise actual code
+    loop._watchdog_check = AgentLoop._watchdog_check.__get__(loop)
 
     for k, v in overrides.items():
         setattr(loop, k, v)
@@ -95,12 +99,29 @@ class TestInspect:
         assert "review" in result
 
     @pytest.mark.asyncio
+    async def test_inspect_none_attribute_shows_value(self):
+        """Attributes that are legitimately None should show their value, not 'not found'."""
+        tool = _make_tool()
+        # web_proxy is initialized as None in the mock
+        result = await tool.execute(action="inspect", key="web_proxy")
+        assert "web_proxy: None" in result
+        assert "not found" not in result
+
+    @pytest.mark.asyncio
     async def test_inspect_unknown_key(self):
-        loop = _make_mock_loop()
-        # Make getattr return None for unknown keys (like a real object)
-        loop.nonexistent = None
-        tool = _make_tool(loop)
-        result = await tool.execute(action="inspect", key="nonexistent")
+        """Use a real object (not MagicMock) so hasattr returns False for missing attrs."""
+        class MinimalLoop:
+            model = "test-model"
+            max_iterations = 40
+            context_window_tokens = 65536
+            context_budget_tokens = 500
+            _runtime_vars = {}
+            _unregistered_tools = {}
+            _config_defaults = {}
+            _critical_tool_backup = {}
+        loop = MinimalLoop()
+        tool = SelfTool(loop=loop)
+        result = await tool.execute(action="inspect", key="nonexistent_key")
         assert "not found" in result
 
 
@@ -247,6 +268,24 @@ class TestModifyFree:
         tool = _make_tool()
         result = await tool.execute(action="modify", key="data", value={"a": 1})
         assert tool._loop._runtime_vars["data"] == {"a": 1}
+
+    @pytest.mark.asyncio
+    async def test_modify_free_rejects_when_max_keys_reached(self):
+        loop = _make_mock_loop()
+        loop._runtime_vars = {f"key_{i}": i for i in range(64)}
+        tool = _make_tool(loop)
+        result = await tool.execute(action="modify", key="overflow", value="data")
+        assert "full" in result
+        assert "overflow" not in loop._runtime_vars
+
+    @pytest.mark.asyncio
+    async def test_modify_free_allows_update_existing_key_at_max(self):
+        loop = _make_mock_loop()
+        loop._runtime_vars = {f"key_{i}": i for i in range(64)}
+        tool = _make_tool(loop)
+        result = await tool.execute(action="modify", key="key_0", value="updated")
+        assert "Error" not in result
+        assert loop._runtime_vars["key_0"] == "updated"
 
 
 # ---------------------------------------------------------------------------
@@ -452,20 +491,13 @@ class TestWatchdog:
     def test_watchdog_corrects_invalid_iterations(self):
         loop = _make_mock_loop()
         loop.max_iterations = 0
-        loop._critical_tool_backup = {}
-        # Simulate watchdog
-        defaults = loop._config_defaults
-        if not (1 <= loop.max_iterations <= 100):
-            loop.max_iterations = defaults["max_iterations"]
+        loop._watchdog_check()
         assert loop.max_iterations == 40
 
     def test_watchdog_corrects_invalid_context_window(self):
         loop = _make_mock_loop()
         loop.context_window_tokens = 100
-        loop._critical_tool_backup = {}
-        defaults = loop._config_defaults
-        if not (4096 <= loop.context_window_tokens <= 1_000_000):
-            loop.context_window_tokens = defaults["context_window_tokens"]
+        loop._watchdog_check()
         assert loop.context_window_tokens == 65_536
 
     def test_watchdog_restores_critical_tools(self):
@@ -474,10 +506,7 @@ class TestWatchdog:
         loop._critical_tool_backup = {"self": backup}
         loop.tools.has.return_value = False
         loop.tools.tool_names = []
-        # Simulate watchdog
-        for name, bk in loop._critical_tool_backup.items():
-            if not loop.tools.has(name):
-                loop.tools.register(copy.deepcopy(bk))
+        loop._watchdog_check()
         loop.tools.register.assert_called()
         # Verify it was called with a copy, not the original
         called_arg = loop.tools.register.call_args[0][0]
@@ -487,13 +516,8 @@ class TestWatchdog:
         loop = _make_mock_loop()
         loop.max_iterations = 50
         loop.context_window_tokens = 131072
-        loop._critical_tool_backup = {}
         original_max = loop.max_iterations
         original_ctx = loop.context_window_tokens
-        # Simulate watchdog
-        if not (1 <= loop.max_iterations <= 100):
-            loop.max_iterations = loop._config_defaults["max_iterations"]
-        if not (4096 <= loop.context_window_tokens <= 1_000_000):
-            loop.context_window_tokens = loop._config_defaults["context_window_tokens"]
+        loop._watchdog_check()
         assert loop.max_iterations == original_max
         assert loop.context_window_tokens == original_ctx
